@@ -68,13 +68,22 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	m.modelMu.RLock()
 	snapshot.Models = make([]ModelStats, 0, len(m.modelCounts))
 	for model, c := range m.modelCounts {
+		avgLatencyMs := 0.0
+		avgTokensPerCall := 0.0
+		if c.RequestsTotal > 0 {
+			avgLatencyMs = float64(c.LatencyTotalNs) / float64(c.RequestsTotal) / float64(time.Millisecond)
+			avgTokensPerCall = float64(c.TokensTotal) / float64(c.RequestsTotal)
+		}
 		snapshot.Models = append(snapshot.Models, ModelStats{
-			Model:           model,
-			RequestsTotal:   c.RequestsTotal,
-			ErrorsTotal:     c.ErrorsTotal,
-			ChatCompletions: c.ChatCompletions,
-			Responses:       c.Responses,
-			OtherRequests:   c.OtherRequests,
+			Model:            model,
+			RequestsTotal:    c.RequestsTotal,
+			ErrorsTotal:      c.ErrorsTotal,
+			ChatCompletions:  c.ChatCompletions,
+			Responses:        c.Responses,
+			OtherRequests:    c.OtherRequests,
+			TokensTotal:      c.TokensTotal,
+			AvgLatencyMs:     avgLatencyMs,
+			AvgTokensPerCall: avgTokensPerCall,
 		})
 	}
 	m.modelMu.RUnlock()
@@ -110,12 +119,15 @@ type MetricsSnapshot struct {
 }
 
 type ModelStats struct {
-	Model           string
-	RequestsTotal   uint64
-	ErrorsTotal     uint64
-	ChatCompletions uint64
-	Responses       uint64
-	OtherRequests   uint64
+	Model            string
+	RequestsTotal    uint64
+	ErrorsTotal      uint64
+	ChatCompletions  uint64
+	Responses        uint64
+	OtherRequests    uint64
+	TokensTotal      uint64
+	AvgLatencyMs     float64
+	AvgTokensPerCall float64
 }
 
 type modelCounters struct {
@@ -124,6 +136,8 @@ type modelCounters struct {
 	ChatCompletions uint64
 	Responses       uint64
 	OtherRequests   uint64
+	TokensTotal     uint64
+	LatencyTotalNs  uint64
 }
 
 func (m *Metrics) Middleware(next http.Handler) http.Handler {
@@ -161,9 +175,16 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 			atomic.AddUint64(&m.status2xx, 1)
 		}
 		atomic.AddUint64(&m.bytesSent, wrapped.bytesWritten)
-		m.observeModel(wrapped.observedModel, r.URL.Path, status)
-
 		latencyNs := uint64(time.Since(startedAt))
+		m.observeModel(
+			wrapped.observedModel,
+			r.URL.Path,
+			status,
+			latencyNs,
+			wrapped.promptTokens,
+			wrapped.completionTokens,
+		)
+
 		atomic.AddUint64(&m.latencyTotalNs, latencyNs)
 		for {
 			cur := atomic.LoadUint64(&m.latencyMaxNs)
@@ -174,7 +195,7 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (m *Metrics) observeModel(model string, path string, status int) {
+func (m *Metrics) observeModel(model string, path string, status int, latencyNs uint64, promptTokens uint64, completionTokens uint64) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return
@@ -198,13 +219,17 @@ func (m *Metrics) observeModel(model string, path string, status int) {
 	default:
 		c.OtherRequests++
 	}
+	c.LatencyTotalNs += latencyNs
+	c.TokensTotal += promptTokens + completionTokens
 }
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status        int
-	bytesWritten  uint64
-	observedModel string
+	status           int
+	bytesWritten     uint64
+	observedModel    string
+	promptTokens     uint64
+	completionTokens uint64
 }
 
 func (r *statusRecorder) WriteHeader(statusCode int) {
@@ -234,6 +259,11 @@ func (r *statusRecorder) SetObservedModel(model string) {
 	r.observedModel = model
 }
 
+func (r *statusRecorder) AddObservedTokens(promptTokens uint64, completionTokens uint64) {
+	r.promptTokens += promptTokens
+	r.completionTokens += completionTokens
+}
+
 type modelObserver interface {
 	SetObservedModel(string)
 }
@@ -241,6 +271,16 @@ type modelObserver interface {
 func ObserveModel(w http.ResponseWriter, model string) {
 	if mw, ok := w.(modelObserver); ok {
 		mw.SetObservedModel(model)
+	}
+}
+
+type tokenObserver interface {
+	AddObservedTokens(uint64, uint64)
+}
+
+func ObserveTokenUsage(w http.ResponseWriter, promptTokens uint64, completionTokens uint64) {
+	if mw, ok := w.(tokenObserver); ok {
+		mw.AddObservedTokens(promptTokens, completionTokens)
 	}
 }
 

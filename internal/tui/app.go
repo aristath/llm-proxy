@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -72,7 +71,7 @@ type model struct {
 func newModel(addr string, metrics *api.Metrics, errCh <-chan error) model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#89dceb"))
 	return model{
 		addr:      addr,
 		metrics:   metrics,
@@ -130,18 +129,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() tea.View {
+	const (
+		mochaMantle   = "#181825"
+		mochaText     = "#cdd6f4"
+		mochaSubtext  = "#bac2de"
+		mochaBlue     = "#89b4fa"
+		mochaGreen    = "#a6e3a1"
+		mochaRed      = "#f38ba8"
+		mochaYellow   = "#f9e2af"
+		mochaPeach    = "#fab387"
+		mochaSapphire = "#74c7ec"
+		mochaOverlay  = "#6c7086"
+	)
+
 	appTitle := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#FFE082")).
+		Foreground(lipgloss.Color(mochaYellow)).
 		Render("llm-proxy")
 	subtitle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#94A3B8")).
+		Foreground(lipgloss.Color(mochaSubtext)).
 		Render("OpenAI-compatible bridge for Claude CLI + Codex CLI")
 
-	statusColor := lipgloss.Color("#22C55E")
+	statusColor := lipgloss.Color(mochaGreen)
 	statusText := "running"
 	if !m.running {
-		statusColor = lipgloss.Color("#EF4444")
+		statusColor = lipgloss.Color(mochaRed)
 		statusText = "stopped"
 	}
 	status := lipgloss.NewStyle().
@@ -149,123 +161,110 @@ func (m model) View() tea.View {
 		Foreground(statusColor).
 		Render(statusText)
 	yoloText := "off"
-	yoloColor := lipgloss.Color("#64748B")
+	yoloColor := lipgloss.Color(mochaOverlay)
 	if m.yolo {
 		yoloText = "ON"
-		yoloColor = lipgloss.Color("#F97316")
+		yoloColor = lipgloss.Color(mochaPeach)
 	}
 	yoloChip := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#0B1020")).
+		Foreground(lipgloss.Color(mochaMantle)).
 		Background(yoloColor).
 		Padding(0, 1).
 		Render(" YOLO " + yoloText + " ")
 	statusChip := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#0B1020")).
+		Foreground(lipgloss.Color(mochaMantle)).
 		Background(statusColor).
 		Padding(0, 1).
 		Render(" " + statusText + " ")
 
 	uptime := time.Since(m.startedAt).Truncate(time.Second)
 	titleBar := lipgloss.NewStyle().
-		Background(lipgloss.Color("#172554")).
-		Foreground(lipgloss.Color("#E2E8F0")).
+		Background(lipgloss.Color(mochaMantle)).
+		Foreground(lipgloss.Color(mochaText)).
 		Padding(0, 1).
 		Render(fmt.Sprintf("%s %s  %s  %s", m.spin.View(), appTitle, statusChip, yoloChip))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, subtitle)
 	if m.yolo {
 		yoloWarning := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FDBA74")).
+			Foreground(lipgloss.Color(mochaPeach)).
 			Render("YOLO enabled: permission prompts and sandbox checks are bypassed in upstream CLIs.")
 		header = lipgloss.JoinVertical(lipgloss.Left, header, yoloWarning)
 	}
 
-	cardTitle := lipgloss.NewStyle().
+	sectionTitle := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#93C5FD"))
+		Foreground(lipgloss.Color(mochaBlue))
 	label := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#94A3B8"))
+		Foreground(lipgloss.Color(mochaSubtext))
 	value := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#E2E8F0"))
+		Foreground(lipgloss.Color(mochaText))
+	sepWidth := 80
+	if m.width > 0 {
+		sepWidth = m.width
+	}
+	separator := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(mochaOverlay)).
+		Render(strings.Repeat("─", sepWidth))
 
 	serviceBody := lipgloss.JoinVertical(lipgloss.Left,
-		cardTitle.Render("Service"),
+		sectionTitle.Render("Service"),
 		fmt.Sprintf("%s %s", label.Render("Status:"), status),
 		fmt.Sprintf("%s %s", label.Render("YOLO mode:"), value.Render(yoloText)),
 		fmt.Sprintf("%s %s", label.Render("Address:"), value.Render("http://127.0.0.1"+m.addr)),
 		fmt.Sprintf("%s %s", label.Render("Uptime:"), value.Render(uptime.String())),
 	)
 	trafficBody := lipgloss.JoinVertical(lipgloss.Left,
-		cardTitle.Render("Traffic"),
+		sectionTitle.Render("Traffic"),
 		fmt.Sprintf("%s %s", label.Render("Requests:"), value.Render(fmt.Sprintf("%d", m.snap.RequestsTotal))),
 		fmt.Sprintf("%s %s", label.Render("Errors:"), value.Render(fmt.Sprintf("%d", m.snap.ErrorsTotal))),
 		fmt.Sprintf("%s %s", label.Render("In flight:"), value.Render(fmt.Sprintf("%d", m.snap.InFlight))),
 		fmt.Sprintf("%s %s", label.Render("Rate (req/s):"), value.Render(fmt.Sprintf("%d", m.reqsPerSec))),
 		fmt.Sprintf("%s %s", label.Render("Bytes out:"), value.Render(humanBytes(m.snap.BytesSent))),
-	)
-	httpBody := lipgloss.JoinVertical(lipgloss.Left,
-		cardTitle.Render("HTTP"),
-		fmt.Sprintf("%s %s", label.Render("2xx:"), value.Render(strconv.FormatUint(m.snap.Status2xx, 10))),
-		fmt.Sprintf("%s %s", label.Render("3xx:"), value.Render(strconv.FormatUint(m.snap.Status3xx, 10))),
-		fmt.Sprintf("%s %s", label.Render("4xx:"), value.Render(strconv.FormatUint(m.snap.Status4xx, 10))),
-		fmt.Sprintf("%s %s", label.Render("5xx:"), value.Render(strconv.FormatUint(m.snap.Status5xx, 10))),
 		fmt.Sprintf("%s %s", label.Render("Avg latency:"), value.Render(fmt.Sprintf("%.1f ms", m.snap.AvgLatencyMs))),
 		fmt.Sprintf("%s %s", label.Render("Max latency:"), value.Render(fmt.Sprintf("%.1f ms", m.snap.MaxLatencyMs))),
 	)
-	endpointsBody := lipgloss.JoinVertical(lipgloss.Left,
-		cardTitle.Render("Endpoints"),
-		fmt.Sprintf("%s %s", label.Render("/v1/models:"), value.Render(strconv.FormatUint(m.snap.ModelsTotal, 10))),
-		fmt.Sprintf("%s %s", label.Render("/v1/chat/completions:"), value.Render(strconv.FormatUint(m.snap.ChatCompletionsTotal, 10))),
-		fmt.Sprintf("%s %s", label.Render("/v1/responses:"), value.Render(strconv.FormatUint(m.snap.ResponsesTotal, 10))),
-		fmt.Sprintf("%s %s", label.Render("Other:"), value.Render(strconv.FormatUint(m.snap.OtherTotal, 10))),
-	)
 	modelsBody := lipgloss.JoinVertical(lipgloss.Left,
-		cardTitle.Render("Per-model"),
-		renderModelStats(m.snap.Models),
+		sectionTitle.Render("Model Stats"),
+		renderModelStatsTable(m.snap.Models),
 	)
-
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#334155")).
-		Padding(1, 2)
-	serviceCard := box.Render(serviceBody)
-	trafficCard := box.Render(trafficBody)
-	httpCard := box.Render(httpBody)
-	endpointsCard := box.Render(endpointsBody)
-	modelsCard := box.Render(modelsBody)
-
-	mainPane := lipgloss.JoinHorizontal(lipgloss.Top, serviceCard, "  ", trafficCard)
-	secondaryPane := lipgloss.JoinHorizontal(lipgloss.Top, httpCard, "  ", endpointsCard)
-	if m.width > 0 && m.width < 96 {
-		mainPane = lipgloss.JoinVertical(lipgloss.Left, serviceCard, "", trafficCard)
-		secondaryPane = lipgloss.JoinVertical(lipgloss.Left, httpCard, "", endpointsCard)
-	}
 
 	errorBlock := ""
 	if m.lastErr != "" {
 		errorBlock = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#B91C1C")).
-			Padding(0, 1).
-			Foreground(lipgloss.Color("#FCA5A5")).
+			Foreground(lipgloss.Color(mochaRed)).
 			Render("Server error: " + m.lastErr)
 	}
 
 	footer := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#94A3B8")).
+		Foreground(lipgloss.Color(mochaSapphire)).
 		Render("[ y ] toggle YOLO   [ q ] quit   [ ctrl+c ] quit and stop proxy")
-	panelBody := lipgloss.JoinVertical(lipgloss.Left, header, "", mainPane, "", secondaryPane, "", modelsCard)
-	if errorBlock != "" {
-		panelBody = lipgloss.JoinVertical(lipgloss.Left, panelBody, "", errorBlock)
-	}
-	panelBody = lipgloss.JoinVertical(lipgloss.Left, panelBody, "", footer)
-	panel := lipgloss.NewStyle().Padding(1, 2).Render(panelBody)
 
-	viewText := panel
-	if m.width > 0 {
-		viewText = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+	panelBody := lipgloss.JoinVertical(
+		lipgloss.Left,
+		header,
+		separator,
+		serviceBody,
+		separator,
+		trafficBody,
+		separator,
+		modelsBody,
+	)
+	if errorBlock != "" {
+		panelBody = lipgloss.JoinVertical(lipgloss.Left, panelBody, separator, errorBlock)
 	}
+	panelBody = lipgloss.JoinVertical(lipgloss.Left, panelBody, separator, footer)
+	panelStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color(mochaMantle)).
+		Padding(1, 2)
+	if m.width > 0 {
+		panelStyle = panelStyle.Width(m.width)
+	}
+	if m.height > 0 {
+		panelStyle = panelStyle.Height(m.height)
+	}
+	viewText := panelStyle.Render(panelBody)
 	v := tea.NewView(viewText)
 	v.AltScreen = true
 	return v
@@ -285,20 +284,36 @@ func humanBytes(n uint64) string {
 	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), suffixes[exp])
 }
 
-func renderModelStats(models []api.ModelStats) string {
+func renderModelStatsTable(models []api.ModelStats) string {
 	if len(models) == 0 {
 		return "No model traffic yet."
 	}
+
+	const modelWidth = 30
+	trim := func(s string) string {
+		r := []rune(strings.TrimSpace(s))
+		if len(r) <= modelWidth {
+			return string(r)
+		}
+		if modelWidth <= 1 {
+			return string(r[:modelWidth])
+		}
+		return string(r[:modelWidth-1]) + "…"
+	}
+
 	var b strings.Builder
-	b.WriteString("Model                          Req  Err  Chat Resp Other\n")
+	b.WriteString(fmt.Sprintf("%-*s %8s %10s %18s %16s\n",
+		modelWidth, "Model", "Requests", "Tokens", "Avg Time/Response", "Avg Tokens/Call"))
+	b.WriteString(strings.Repeat("─", modelWidth+8+10+18+16+4))
+	b.WriteByte('\n')
 	for _, s := range models {
-		row := fmt.Sprintf("%-30s %4d %4d %4d %4d %5d",
-			s.Model,
+		row := fmt.Sprintf("%-*s %8d %10d %17.1fms %16.1f",
+			modelWidth,
+			trim(s.Model),
 			s.RequestsTotal,
-			s.ErrorsTotal,
-			s.ChatCompletions,
-			s.Responses,
-			s.OtherRequests,
+			s.TokensTotal,
+			s.AvgLatencyMs,
+			s.AvgTokensPerCall,
 		)
 		b.WriteString(row)
 		b.WriteByte('\n')

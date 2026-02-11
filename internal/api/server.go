@@ -81,6 +81,7 @@ func (s *Server) CreateChatCompletion(w http.ResponseWriter, r *http.Request) {
 			Content: m.Content,
 		})
 	}
+	promptTokens := estimateMessagesTokens(in.Messages)
 
 	resp, err := adapter.Chat(r.Context(), in)
 	if err != nil {
@@ -89,6 +90,7 @@ func (s *Server) CreateChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	text := strings.TrimSpace(resp.Text)
+	ObserveTokenUsage(w, promptTokens, estimateTextTokens(text))
 	finish := "stop"
 	writeJSON(w, http.StatusOK, openapiv1.ChatCompletionsResponse{
 		Id:     genID("chatcmpl"),
@@ -135,6 +137,7 @@ func (s *Server) CreateResponse(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(raw, &input)
 		}
 	}
+	promptTokens := estimateInputTokens(input)
 
 	resp, err := adapter.Respond(r.Context(), proxy.ResponsesRequest{
 		Model:  req.Model,
@@ -145,6 +148,7 @@ func (s *Server) CreateResponse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
+	ObserveTokenUsage(w, promptTokens, estimateTextTokens(resp.Text)+estimateTextTokens(resp.Reasoning))
 
 	output := make([]map[string]any, 0, 2)
 	if strings.TrimSpace(resp.Reasoning) != "" {
@@ -219,11 +223,14 @@ func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 	for _, m := range req.Messages {
 		in.Messages = append(in.Messages, proxy.Message{Role: m.Role, Content: m.Content})
 	}
+	promptTokens := estimateMessagesTokens(in.Messages)
+	var out strings.Builder
 
 	_, err = adapter.ChatStream(ctx, in, func(delta string) error {
 		if strings.TrimSpace(delta) == "" {
 			return nil
 		}
+		out.WriteString(delta)
 		if writeErr := sse.writeJSON(map[string]any{
 			"id":     reqID,
 			"object": "chat.completion.chunk",
@@ -252,6 +259,7 @@ func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 		_ = sse.writeDone()
 		return
 	}
+	ObserveTokenUsage(w, promptTokens, estimateTextTokens(out.String()))
 
 	_ = sse.writeJSON(map[string]any{
 		"id":     reqID,
@@ -303,6 +311,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 			_ = json.Unmarshal(raw, &input)
 		}
 	}
+	promptTokens := estimateInputTokens(input)
 
 	seq := int64(1)
 	nextSeq := func() int64 {
@@ -475,6 +484,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 		_ = sse.writeDone()
 		return
 	}
+	ObserveTokenUsage(w, promptTokens, estimateTextTokens(outputText.String())+estimateTextTokens(reasoningText.String()))
 
 	if !messageStarted {
 		_ = startMessage()
@@ -635,4 +645,40 @@ func (s *sseWriter) writeDone() error {
 
 func genID(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}
+
+func estimateMessagesTokens(messages []proxy.Message) uint64 {
+	var total uint64
+	for _, msg := range messages {
+		total += estimateTextTokens(msg.Role)
+		total += estimateTextTokens(msg.Content)
+	}
+	return total
+}
+
+func estimateInputTokens(input any) uint64 {
+	if input == nil {
+		return 0
+	}
+	if s, ok := input.(string); ok {
+		return estimateTextTokens(s)
+	}
+	b, err := json.Marshal(input)
+	if err != nil {
+		return 0
+	}
+	return estimateTextTokens(string(b))
+}
+
+func estimateTextTokens(text string) uint64 {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	runes := uint64(len([]rune(text)))
+	approx := (runes + 3) / 4
+	if approx == 0 {
+		return 1
+	}
+	return approx
 }
