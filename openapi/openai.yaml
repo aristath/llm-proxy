@@ -1,0 +1,214 @@
+openapi: 3.0.3
+info:
+  title: OpenAI-Compatible Proxy API
+  version: "0.1.0"
+servers:
+  - url: /
+paths:
+  /v1/models:
+    get:
+      operationId: listModels
+      responses:
+        "200":
+          description: Model list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelListResponse"
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionsRequest"
+      responses:
+        "200":
+          description: Chat completion response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionsResponse"
+  /v1/responses:
+    post:
+      operationId: createResponse
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResponsesRequest"
+      responses:
+        "200":
+          description: Responses API response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResponsesResponse"
+
+components:
+  schemas:
+    Model:
+      type: object
+      required:
+        - id
+        - object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [model]
+        owned_by:
+          type: string
+    ModelListResponse:
+      type: object
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Model"
+
+    ChatMessage:
+      type: object
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+        content:
+          type: string
+    ChatCompletionsRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        stream:
+          type: boolean
+          default: false
+    ChatChoice:
+      type: object
+      required:
+        - index
+        - message
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: "#/components/schemas/ChatMessage"
+        finish_reason:
+          type: string
+    Usage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+    ChatCompletionsResponse:
+      type: object
+      required:
+        - id
+        - object
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion]
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatChoice"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    ResponsesInputItem:
+      oneOf:
+        - type: string
+        - type: object
+    ResponsesRequest:
+      type: object
+      required:
+        - model
+      properties:
+        model:
+          type: string
+        input:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: "#/components/schemas/ResponsesInputItem"
+        stream:
+          type: boolean
+          default: false
+    ResponsesOutputText:
+      type: object
+      required:
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum: [output_text]
+        text:
+          type: string
+    ResponsesOutputItem:
+      type: object
+      required:
+        - id
+        - type
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResponsesOutputText"
+    ResponsesResponse:
+      type: object
+      required:
+        - id
+        - object
+        - model
+        - output
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [response]
+        model:
+          type: string
+        output:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResponsesOutputItem"
+        usage:
+          $ref: "#/components/schemas/Usage"
+

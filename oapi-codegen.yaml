@@ -1,0 +1,7 @@
+package: openapiv1
+generate:
+  std-http-server: true
+  models: true
+output: gen.go
+output-options:
+  skip-prune: true
