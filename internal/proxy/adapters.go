@@ -185,16 +185,44 @@ func (a *ClaudeAdapter) RespondStream(ctx context.Context, req ResponsesRequest,
 }
 
 func (a *ClaudeAdapter) RespondStreamEvents(ctx context.Context, req ResponsesRequest, onEvent func(ResponseEvent) error) (ResponsesResponse, error) {
-	resp, err := a.RespondStream(ctx, req, func(delta string) error {
-		if onEvent == nil {
-			return nil
-		}
-		return onEvent(ResponseEvent{Kind: ResponseEventOutput, Delta: delta})
-	})
-	if err != nil {
+	if err := a.ensureSubscriptionMode(); err != nil {
 		return ResponsesResponse{}, err
 	}
-	return resp, nil
+	model := req.Model
+	prompt := buildResponsesPrompt(req.Input)
+
+	text, reasoning, emittedOutput, emittedReasoning, err := a.runClaudeStreamEvents(ctx, model, prompt, onEvent)
+	if err != nil {
+		fallback, fbErr := a.runClaudeText(ctx, model, prompt)
+		if fbErr != nil {
+			return ResponsesResponse{}, err
+		}
+		text = strings.TrimSpace(fallback)
+		if onEvent != nil && !emittedOutput && text != "" {
+			if cbErr := onEvent(ResponseEvent{Kind: ResponseEventOutput, Delta: text}); cbErr != nil {
+				return ResponsesResponse{}, cbErr
+			}
+		}
+		return ResponsesResponse{Model: req.Model, Text: text, Reasoning: strings.TrimSpace(reasoning)}, nil
+	}
+	if strings.TrimSpace(text) == "" {
+		fallback, fbErr := a.runClaudeText(ctx, model, prompt)
+		if fbErr != nil {
+			return ResponsesResponse{}, fbErr
+		}
+		text = strings.TrimSpace(fallback)
+		if onEvent != nil && !emittedOutput && text != "" {
+			if cbErr := onEvent(ResponseEvent{Kind: ResponseEventOutput, Delta: text}); cbErr != nil {
+				return ResponsesResponse{}, cbErr
+			}
+		}
+	}
+	if onEvent != nil && !emittedReasoning && strings.TrimSpace(reasoning) != "" {
+		if cbErr := onEvent(ResponseEvent{Kind: ResponseEventReasoning, Delta: strings.TrimSpace(reasoning)}); cbErr != nil {
+			return ResponsesResponse{}, cbErr
+		}
+	}
+	return ResponsesResponse{Model: req.Model, Text: text, Reasoning: strings.TrimSpace(reasoning)}, nil
 }
 
 func (a *ClaudeAdapter) runClaudeText(ctx context.Context, model string, prompt string) (string, error) {
@@ -244,21 +272,21 @@ func (a *ClaudeAdapter) runClaudeStream(ctx context.Context, model string, promp
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var out strings.Builder
 	emitted := false
-	lastByIndex := map[int]string{}
+	lastByIndex := map[string]string{}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		delta, ok := extractClaudeDelta(line, lastByIndex)
-		if !ok || delta == "" {
+		ev, ok := extractClaudeEvent(line, lastByIndex)
+		if !ok || ev.Delta == "" || ev.Kind != ResponseEventOutput {
 			continue
 		}
-		out.WriteString(delta)
+		out.WriteString(ev.Delta)
 		emitted = true
 		if onDelta != nil {
-			if err := onDelta(delta); err != nil {
+			if err := onDelta(ev.Delta); err != nil {
 				_ = cmd.Process.Kill()
 				_ = cmd.Wait()
 				return "", emitted, err
@@ -276,36 +304,117 @@ func (a *ClaudeAdapter) runClaudeStream(ctx context.Context, model string, promp
 	return strings.TrimSpace(out.String()), emitted, nil
 }
 
-func extractClaudeDelta(line string, lastByIndex map[int]string) (string, bool) {
+func (a *ClaudeAdapter) runClaudeStreamEvents(ctx context.Context, model string, prompt string, onEvent func(ResponseEvent) error) (string, string, bool, bool, error) {
+	args := []string{
+		"-p",
+		"--verbose",
+		"--output-format", "stream-json",
+		"--include-partial-messages",
+		"--model", model,
+	}
+	if YOLOEnabled() {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	args = append(args, prompt)
+	cmd := exec.CommandContext(ctx, a.bin, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", false, false, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", "", false, false, err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var output strings.Builder
+	var reasoning strings.Builder
+	emittedOutput := false
+	emittedReasoning := false
+	lastByIndex := map[string]string{}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		ev, ok := extractClaudeEvent(line, lastByIndex)
+		if !ok || ev.Delta == "" {
+			continue
+		}
+		if ev.Kind == ResponseEventReasoning {
+			reasoning.WriteString(ev.Delta)
+			emittedReasoning = true
+		} else {
+			output.WriteString(ev.Delta)
+			emittedOutput = true
+		}
+		if onEvent != nil {
+			if err := onEvent(ev); err != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				return "", "", emittedOutput, emittedReasoning, err
+			}
+		}
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return "", "", emittedOutput, emittedReasoning, scanErr
+	}
+	if err := cmd.Wait(); err != nil {
+		return "", "", emittedOutput, emittedReasoning, fmt.Errorf("claude stream command failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(output.String()), strings.TrimSpace(reasoning.String()), emittedOutput, emittedReasoning, nil
+}
+
+func extractClaudeEvent(line string, lastByIndex map[string]string) (ResponseEvent, bool) {
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		return "", false
+		return ResponseEvent{}, false
+	}
+
+	// claude stream-json wraps token deltas inside {"type":"stream_event","event":{...}}
+	// while other entries may include top-level assistant/message objects.
+	if strings.EqualFold(stringVal(raw["type"]), "stream_event") {
+		if ev, ok := raw["event"].(map[string]any); ok {
+			raw = ev
+		}
 	}
 
 	typ := stringVal(raw["type"])
 	switch typ {
 	case "content_block_delta":
 		if d, ok := raw["delta"].(map[string]any); ok {
+			if t := stringVal(d["thinking"]); t != "" {
+				return ResponseEvent{Kind: ResponseEventReasoning, Delta: t}, true
+			}
 			if t := stringVal(d["text"]); t != "" {
-				return t, true
+				return ResponseEvent{Kind: ResponseEventOutput, Delta: t}, true
 			}
 		}
 	case "content_block_start":
 		if cb, ok := raw["content_block"].(map[string]any); ok {
+			if t := stringVal(cb["thinking"]); t != "" {
+				return ResponseEvent{Kind: ResponseEventReasoning, Delta: t}, true
+			}
 			if t := stringVal(cb["text"]); t != "" {
-				return t, true
+				return ResponseEvent{Kind: ResponseEventOutput, Delta: t}, true
 			}
 		}
 	case "message_delta":
 		if d, ok := raw["delta"].(map[string]any); ok {
 			if t := stringVal(d["text"]); t != "" {
-				return t, true
+				return ResponseEvent{Kind: ResponseEventOutput, Delta: t}, true
 			}
 		}
 	}
 
-	// Fallback parser for event shapes that expose growing partial content.
-	if msg, ok := raw["message"].(map[string]any); ok {
+	// Fallback parser for legacy shapes that expose growing partial content.
+	// Skip assistant/user snapshots when stream_event deltas are available to avoid duplicates.
+	if msg, ok := raw["message"].(map[string]any); ok && !strings.EqualFold(typ, "assistant") && !strings.EqualFold(typ, "user") {
 		if content, ok := msg["content"].([]any); ok {
 			for idx, it := range content {
 				item, ok := it.(map[string]any)
@@ -313,25 +422,35 @@ func extractClaudeDelta(line string, lastByIndex map[int]string) (string, bool) 
 					continue
 				}
 				full := stringVal(item["text"])
+				kind := ResponseEventOutput
+				if strings.EqualFold(stringVal(item["type"]), "thinking") {
+					full = stringVal(item["thinking"])
+					kind = ResponseEventReasoning
+				}
 				if full == "" {
 					continue
 				}
-				prev := lastByIndex[idx]
+				cacheKey := fmt.Sprintf("%d:%s", idx, kind)
+				prev := lastByIndex[cacheKey]
 				if strings.HasPrefix(full, prev) {
 					delta := strings.TrimPrefix(full, prev)
-					lastByIndex[idx] = full
+					lastByIndex[cacheKey] = full
 					if delta != "" {
-						return delta, true
+						return ResponseEvent{Kind: kind, Delta: delta}, true
 					}
 				} else if prev == "" {
-					lastByIndex[idx] = full
-					return full, true
+					lastByIndex[cacheKey] = full
+					return ResponseEvent{Kind: kind, Delta: full}, true
+				} else {
+					// New assistant message or reset of the same index; emit full text again.
+					lastByIndex[cacheKey] = full
+					return ResponseEvent{Kind: kind, Delta: full}, true
 				}
 			}
 		}
 	}
 
-	return "", false
+	return ResponseEvent{}, false
 }
 
 func stringVal(v any) string {
