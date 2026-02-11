@@ -37,8 +37,25 @@ type ResponsesRequest struct {
 }
 
 type ResponsesResponse struct {
-	Model string
-	Text  string
+	Model     string
+	Text      string
+	Reasoning string
+}
+
+type ResponseEventKind string
+
+const (
+	ResponseEventReasoning ResponseEventKind = "reasoning"
+	ResponseEventOutput    ResponseEventKind = "output"
+)
+
+type ResponseEvent struct {
+	Kind  ResponseEventKind
+	Delta string
+}
+
+type ResponsesEventAdapter interface {
+	RespondStreamEvents(context.Context, ResponsesRequest, func(ResponseEvent) error) (ResponsesResponse, error)
 }
 
 type Adapter interface {

@@ -32,7 +32,7 @@ func NewClaudeAdapter() *ClaudeAdapter {
 
 func parseClaudeModels(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
-		return []string{"sonnet", "opus"}
+		return []string{"haiku", "sonnet", "opus"}
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
@@ -44,7 +44,7 @@ func parseClaudeModels(raw string) []string {
 		out = append(out, p)
 	}
 	if len(out) == 0 {
-		return []string{"sonnet", "opus"}
+		return []string{"haiku", "sonnet", "opus"}
 	}
 	return out
 }
@@ -64,16 +64,26 @@ func (a *ClaudeAdapter) ListModels(ctx context.Context) ([]Model, error) {
 	}
 	out := make([]Model, 0, len(a.models))
 	for _, m := range a.models {
-		out = append(out, Model{ID: "claude/" + m, Backend: BackendClaude})
+		out = append(out, Model{ID: m, Backend: BackendClaude})
 	}
 	return out, nil
+}
+
+func (a *ClaudeAdapter) SupportsModel(_ context.Context, model string) (bool, error) {
+	model = strings.TrimSpace(model)
+	for _, m := range a.models {
+		if m == model {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (a *ClaudeAdapter) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	if err := a.ensureSubscriptionMode(); err != nil {
 		return ChatResponse{}, err
 	}
-	model := trimModelPrefix(req.Model, "claude/")
+	model := req.Model
 	prompt := buildChatPrompt(req.Messages)
 	out, err := a.runClaudeText(ctx, model, prompt)
 	if err != nil {
@@ -89,7 +99,7 @@ func (a *ClaudeAdapter) ChatStream(ctx context.Context, req ChatRequest, onDelta
 	if err := a.ensureSubscriptionMode(); err != nil {
 		return ChatResponse{}, err
 	}
-	model := trimModelPrefix(req.Model, "claude/")
+	model := req.Model
 	prompt := buildChatPrompt(req.Messages)
 
 	text, emitted, err := a.runClaudeStream(ctx, model, prompt, onDelta)
@@ -125,15 +135,16 @@ func (a *ClaudeAdapter) Respond(ctx context.Context, req ResponsesRequest) (Resp
 	if err := a.ensureSubscriptionMode(); err != nil {
 		return ResponsesResponse{}, err
 	}
-	model := trimModelPrefix(req.Model, "claude/")
+	model := req.Model
 	prompt := buildResponsesPrompt(req.Input)
 	out, err := a.runClaudeText(ctx, model, prompt)
 	if err != nil {
 		return ResponsesResponse{}, err
 	}
 	return ResponsesResponse{
-		Model: req.Model,
-		Text:  strings.TrimSpace(out),
+		Model:     req.Model,
+		Text:      strings.TrimSpace(out),
+		Reasoning: "",
 	}, nil
 }
 
@@ -141,7 +152,7 @@ func (a *ClaudeAdapter) RespondStream(ctx context.Context, req ResponsesRequest,
 	if err := a.ensureSubscriptionMode(); err != nil {
 		return ResponsesResponse{}, err
 	}
-	model := trimModelPrefix(req.Model, "claude/")
+	model := req.Model
 	prompt := buildResponsesPrompt(req.Input)
 
 	text, emitted, err := a.runClaudeStream(ctx, model, prompt, onDelta)
@@ -170,7 +181,20 @@ func (a *ClaudeAdapter) RespondStream(ctx context.Context, req ResponsesRequest,
 			}
 		}
 	}
-	return ResponsesResponse{Model: req.Model, Text: text}, nil
+	return ResponsesResponse{Model: req.Model, Text: text, Reasoning: ""}, nil
+}
+
+func (a *ClaudeAdapter) RespondStreamEvents(ctx context.Context, req ResponsesRequest, onEvent func(ResponseEvent) error) (ResponsesResponse, error) {
+	resp, err := a.RespondStream(ctx, req, func(delta string) error {
+		if onEvent == nil {
+			return nil
+		}
+		return onEvent(ResponseEvent{Kind: ResponseEventOutput, Delta: delta})
+	})
+	if err != nil {
+		return ResponsesResponse{}, err
+	}
+	return resp, nil
 }
 
 func (a *ClaudeAdapter) runClaudeText(ctx context.Context, model string, prompt string) (string, error) {
@@ -178,8 +202,11 @@ func (a *ClaudeAdapter) runClaudeText(ctx context.Context, model string, prompt 
 		"-p",
 		"--output-format", "text",
 		"--model", model,
-		prompt,
 	}
+	if YOLOEnabled() {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	args = append(args, prompt)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -197,8 +224,11 @@ func (a *ClaudeAdapter) runClaudeStream(ctx context.Context, model string, promp
 		"--output-format", "stream-json",
 		"--include-partial-messages",
 		"--model", model,
-		prompt,
 	}
+	if YOLOEnabled() {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	args = append(args, prompt)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -390,24 +420,37 @@ func (a *CodexAdapter) ListModels(ctx context.Context) ([]Model, error) {
 	out := make([]Model, 0, len(resp.Data))
 	for _, m := range resp.Data {
 		out = append(out, Model{
-			ID:      "codex/" + m.ID,
+			ID:      m.ID,
 			Backend: BackendCodex,
 		})
 	}
 	return out, nil
 }
 
+func (a *CodexAdapter) SupportsModel(ctx context.Context, model string) (bool, error) {
+	models, err := a.ListModels(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, m := range models {
+		if m.ID == model {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (a *CodexAdapter) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	if err := a.ensureSubscriptionMode(ctx); err != nil {
 		return ChatResponse{}, err
 	}
-	text, err := a.runTurn(ctx, trimModelPrefix(req.Model, "codex/"), buildChatPrompt(req.Messages), nil)
+	turn, err := a.runTurnStructured(ctx, req.Model, buildChatPrompt(req.Messages), nil)
 	if err != nil {
 		return ChatResponse{}, err
 	}
 	return ChatResponse{
 		Model: req.Model,
-		Text:  text,
+		Text:  turn.Output,
 	}, nil
 }
 
@@ -415,13 +458,18 @@ func (a *CodexAdapter) ChatStream(ctx context.Context, req ChatRequest, onDelta 
 	if err := a.ensureSubscriptionMode(ctx); err != nil {
 		return ChatResponse{}, err
 	}
-	text, err := a.runTurn(ctx, trimModelPrefix(req.Model, "codex/"), buildChatPrompt(req.Messages), onDelta)
+	turn, err := a.runTurnStructured(ctx, req.Model, buildChatPrompt(req.Messages), nil)
 	if err != nil {
 		return ChatResponse{}, err
 	}
+	if onDelta != nil && strings.TrimSpace(turn.Output) != "" {
+		if err := onDelta(turn.Output); err != nil {
+			return ChatResponse{}, err
+		}
+	}
 	return ChatResponse{
 		Model: req.Model,
-		Text:  text,
+		Text:  turn.Output,
 	}, nil
 }
 
@@ -429,13 +477,14 @@ func (a *CodexAdapter) Respond(ctx context.Context, req ResponsesRequest) (Respo
 	if err := a.ensureSubscriptionMode(ctx); err != nil {
 		return ResponsesResponse{}, err
 	}
-	text, err := a.runTurn(ctx, trimModelPrefix(req.Model, "codex/"), buildResponsesPrompt(req.Input), nil)
+	turn, err := a.runTurnStructured(ctx, req.Model, buildResponsesPrompt(req.Input), nil)
 	if err != nil {
 		return ResponsesResponse{}, err
 	}
 	return ResponsesResponse{
-		Model: req.Model,
-		Text:  text,
+		Model:     req.Model,
+		Text:      turn.Output,
+		Reasoning: turn.Reasoning,
 	}, nil
 }
 
@@ -443,14 +492,249 @@ func (a *CodexAdapter) RespondStream(ctx context.Context, req ResponsesRequest, 
 	if err := a.ensureSubscriptionMode(ctx); err != nil {
 		return ResponsesResponse{}, err
 	}
-	text, err := a.runTurn(ctx, trimModelPrefix(req.Model, "codex/"), buildResponsesPrompt(req.Input), onDelta)
+	turn, err := a.runTurnStructured(ctx, req.Model, buildResponsesPrompt(req.Input), nil)
+	if err != nil {
+		return ResponsesResponse{}, err
+	}
+	if onDelta != nil && strings.TrimSpace(turn.Output) != "" {
+		if err := onDelta(turn.Output); err != nil {
+			return ResponsesResponse{}, err
+		}
+	}
+	return ResponsesResponse{
+		Model:     req.Model,
+		Text:      turn.Output,
+		Reasoning: turn.Reasoning,
+	}, nil
+}
+
+func (a *CodexAdapter) RespondStreamEvents(ctx context.Context, req ResponsesRequest, onEvent func(ResponseEvent) error) (ResponsesResponse, error) {
+	if err := a.ensureSubscriptionMode(ctx); err != nil {
+		return ResponsesResponse{}, err
+	}
+	turn, err := a.runTurnStructured(ctx, req.Model, buildResponsesPrompt(req.Input), onEvent)
 	if err != nil {
 		return ResponsesResponse{}, err
 	}
 	return ResponsesResponse{
-		Model: req.Model,
-		Text:  text,
+		Model:     req.Model,
+		Text:      turn.Output,
+		Reasoning: turn.Reasoning,
 	}, nil
+}
+
+type codexTurnResult struct {
+	Output    string
+	Reasoning string
+}
+
+type codexTurnState struct {
+	currentAgent strings.Builder
+	agentMsgs    []string
+	reasoning    strings.Builder
+	inAgentMsg   bool
+}
+
+func (s *codexTurnState) appendReasoning(delta string) {
+	if strings.TrimSpace(delta) == "" {
+		return
+	}
+	s.reasoning.WriteString(delta)
+}
+
+func (s *codexTurnState) appendAgentDelta(delta string) {
+	s.inAgentMsg = true
+	s.currentAgent.WriteString(delta)
+}
+
+func (s *codexTurnState) completeAgentMessage() {
+	msg := strings.TrimSpace(s.currentAgent.String())
+	if msg != "" {
+		s.agentMsgs = append(s.agentMsgs, msg)
+	}
+	s.currentAgent.Reset()
+	s.inAgentMsg = false
+}
+
+func (s *codexTurnState) finalize() {
+	if s.inAgentMsg || s.currentAgent.Len() > 0 {
+		s.completeAgentMessage()
+	}
+}
+
+func (s *codexTurnState) result(lastAgentMessage string) codexTurnResult {
+	s.finalize()
+	output := strings.TrimSpace(lastAgentMessage)
+	if output == "" && len(s.agentMsgs) > 0 {
+		output = strings.TrimSpace(s.agentMsgs[len(s.agentMsgs)-1])
+	}
+
+	reasoningParts := make([]string, 0, len(s.agentMsgs))
+	for i := 0; i+1 < len(s.agentMsgs); i++ {
+		if strings.TrimSpace(s.agentMsgs[i]) != "" {
+			reasoningParts = append(reasoningParts, strings.TrimSpace(s.agentMsgs[i]))
+		}
+	}
+	reasoning := strings.TrimSpace(s.reasoning.String())
+	if len(reasoningParts) > 0 {
+		progress := strings.Join(reasoningParts, "\n\n")
+		if reasoning != "" {
+			reasoning = reasoning + "\n\n" + progress
+		} else {
+			reasoning = progress
+		}
+	}
+	return codexTurnResult{
+		Output:    output,
+		Reasoning: strings.TrimSpace(reasoning),
+	}
+}
+
+func (a *CodexAdapter) runTurnStructured(ctx context.Context, model string, prompt string, onEvent func(ResponseEvent) error) (codexTurnResult, error) {
+	client, err := newCodexRPCClient(ctx, a.bin)
+	if err != nil {
+		return codexTurnResult{}, err
+	}
+	defer client.Close()
+
+	if err := client.initialize(); err != nil {
+		return codexTurnResult{}, err
+	}
+
+	var threadStart struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := client.call("thread/start", map[string]any{
+		"model":     model,
+		"ephemeral": true,
+	}, &threadStart, nil); err != nil {
+		return codexTurnResult{}, err
+	}
+	if threadStart.Thread.ID == "" {
+		return codexTurnResult{}, errors.New("codex returned empty thread id")
+	}
+
+	var (
+		lastAgentMessage string
+		callbackErr      error
+		state            codexTurnState
+		emittedReasoning bool
+	)
+
+	emit := func(kind ResponseEventKind, delta string) {
+		if onEvent == nil || callbackErr != nil || strings.TrimSpace(delta) == "" {
+			return
+		}
+		if err := onEvent(ResponseEvent{Kind: kind, Delta: delta}); err != nil {
+			callbackErr = err
+		}
+	}
+
+	notify := func(msg codexRPCMessage) {
+		switch msg.Method {
+		case "item/reasoning/summaryTextDelta":
+			var payload struct {
+				Delta string `json:"delta"`
+			}
+			if json.Unmarshal(msg.Params, &payload) == nil && payload.Delta != "" {
+				state.appendReasoning(payload.Delta)
+				emittedReasoning = true
+				emit(ResponseEventReasoning, payload.Delta)
+			}
+		case "item/agentMessage/delta":
+			var payload struct {
+				Delta string `json:"delta"`
+			}
+			if json.Unmarshal(msg.Params, &payload) == nil && payload.Delta != "" {
+				state.appendAgentDelta(payload.Delta)
+			}
+		case "item/started":
+			var payload struct {
+				Item struct {
+					Type string `json:"type"`
+				} `json:"item"`
+			}
+			if json.Unmarshal(msg.Params, &payload) == nil {
+				if strings.EqualFold(payload.Item.Type, "agentMessage") {
+					// New assistant message: close previous if it never got an explicit completed event.
+					if state.currentAgent.Len() > 0 {
+						state.completeAgentMessage()
+					}
+					state.inAgentMsg = true
+				}
+			}
+		case "item/completed":
+			var payload struct {
+				Item struct {
+					Type string `json:"type"`
+				} `json:"item"`
+			}
+			if json.Unmarshal(msg.Params, &payload) == nil {
+				if strings.EqualFold(payload.Item.Type, "agentMessage") {
+					state.completeAgentMessage()
+				}
+			}
+		case "codex/event/task_complete":
+			var payload struct {
+				Msg struct {
+					LastAgentMessage string `json:"last_agent_message"`
+				} `json:"msg"`
+			}
+			if json.Unmarshal(msg.Params, &payload) == nil {
+				lastAgentMessage = payload.Msg.LastAgentMessage
+			}
+		}
+	}
+
+	var turnResp map[string]any
+	err = client.call("turn/start", map[string]any{
+		"threadId": threadStart.Thread.ID,
+		"model":    model,
+		"input": []map[string]any{
+			{
+				"type": "text",
+				"text": prompt,
+			},
+		},
+	}, &turnResp, notify)
+	if err != nil {
+		return codexTurnResult{}, err
+	}
+
+	waitDone := false
+	for !waitDone {
+		select {
+		case <-ctx.Done():
+			return codexTurnResult{}, ctx.Err()
+		case msg, ok := <-client.msgs:
+			if !ok {
+				waitDone = true
+				continue
+			}
+			notify(msg)
+			if msg.Method == "turn/completed" {
+				waitDone = true
+			}
+		}
+	}
+	if callbackErr != nil {
+		return codexTurnResult{}, callbackErr
+	}
+
+	result := state.result(lastAgentMessage)
+	if result.Output == "" {
+		return codexTurnResult{}, errors.New("codex returned empty assistant output")
+	}
+	if !emittedReasoning && strings.TrimSpace(result.Reasoning) != "" {
+		emit(ResponseEventReasoning, result.Reasoning)
+	}
+	emit(ResponseEventOutput, result.Output)
+	if callbackErr != nil {
+		return codexTurnResult{}, callbackErr
+	}
+	return result, nil
 }
 
 func (a *CodexAdapter) runTurn(ctx context.Context, model string, prompt string, onDelta func(string) error) (string, error) {
@@ -563,15 +847,30 @@ func NewRouter(claude Adapter, codex Adapter) *Router {
 	return &Router{claude: claude, codex: codex}
 }
 
-func (r *Router) AdapterForModel(model string) (Adapter, error) {
-	switch {
-	case strings.HasPrefix(model, "claude/"):
-		return r.claude, nil
-	case strings.HasPrefix(model, "codex/"):
-		return r.codex, nil
-	default:
-		return nil, fmt.Errorf("unsupported model namespace: %s", model)
+type modelSupporter interface {
+	SupportsModel(context.Context, string) (bool, error)
+}
+
+func (r *Router) AdapterForModel(ctx context.Context, model string) (Adapter, error) {
+	if s, ok := r.claude.(modelSupporter); ok {
+		supported, err := s.SupportsModel(ctx, model)
+		if err != nil {
+			return nil, fmt.Errorf("failed checking Claude models: %w", err)
+		}
+		if supported {
+			return r.claude, nil
+		}
 	}
+	if s, ok := r.codex.(modelSupporter); ok {
+		supported, err := s.SupportsModel(ctx, model)
+		if err != nil {
+			return nil, fmt.Errorf("failed checking Codex models: %w", err)
+		}
+		if supported {
+			return r.codex, nil
+		}
+	}
+	return nil, fmt.Errorf("unsupported model id: %s", model)
 }
 
 func (r *Router) ListModels(ctx context.Context) ([]Model, error) {
@@ -609,7 +908,11 @@ type codexRPCMessage struct {
 }
 
 func newCodexRPCClient(ctx context.Context, bin string) (*codexRPCClient, error) {
-	cmd := exec.CommandContext(ctx, bin, "app-server")
+	args := []string{"app-server"}
+	if YOLOEnabled() {
+		args = []string{"--dangerously-bypass-approvals-and-sandbox", "app-server"}
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -753,10 +1056,6 @@ func buildResponsesPrompt(input any) string {
 		}
 		return string(b)
 	}
-}
-
-func trimModelPrefix(model, prefix string) string {
-	return strings.TrimPrefix(model, prefix)
 }
 
 func envOrDefault(key, fallback string) string {

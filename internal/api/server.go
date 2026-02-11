@@ -54,6 +54,7 @@ func (s *Server) CreateChatCompletion(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
+	ObserveModel(w, req.Model)
 	if len(req.Messages) == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages are required")
 		return
@@ -63,7 +64,7 @@ func (s *Server) CreateChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, err := s.router.AdapterForModel(req.Model)
+	adapter, err := s.router.AdapterForModel(r.Context(), req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -116,12 +117,13 @@ func (s *Server) CreateResponse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
+	ObserveModel(w, req.Model)
 	if req.Stream != nil && *req.Stream {
 		s.streamResponse(w, r, req)
 		return
 	}
 
-	adapter, err := s.router.AdapterForModel(req.Model)
+	adapter, err := s.router.AdapterForModel(r.Context(), req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -144,27 +146,44 @@ func (s *Server) CreateResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, openapiv1.ResponsesResponse{
-		Id:     genID("resp"),
-		Object: openapiv1.Response,
-		Model:  req.Model,
-		Output: []openapiv1.ResponsesOutputItem{
-			{
-				Id:   genID("out"),
-				Type: "message",
-				Content: &[]openapiv1.ResponsesOutputText{
-					{
-						Type: openapiv1.OutputText,
-						Text: resp.Text,
-					},
+	output := make([]map[string]any, 0, 2)
+	if strings.TrimSpace(resp.Reasoning) != "" {
+		output = append(output, map[string]any{
+			"id":     genID("rsn"),
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]any{
+				{
+					"type": "summary_text",
+					"text": strings.TrimSpace(resp.Reasoning),
 				},
 			},
+		})
+	}
+	output = append(output, map[string]any{
+		"id":     genID("msg"),
+		"type":   "message",
+		"role":   "assistant",
+		"status": "completed",
+		"content": []map[string]any{
+			{
+				"type": "output_text",
+				"text": resp.Text,
+			},
 		},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         genID("resp"),
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"model":      req.Model,
+		"status":     "completed",
+		"output":     output,
 	})
 }
 
 func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, req openapiv1.ChatCompletionsRequest) {
-	adapter, err := s.router.AdapterForModel(req.Model)
+	adapter, err := s.router.AdapterForModel(r.Context(), req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -250,7 +269,7 @@ func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 }
 
 func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req openapiv1.ResponsesRequest) {
-	adapter, err := s.router.AdapterForModel(req.Model)
+	adapter, err := s.router.AdapterForModel(r.Context(), req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -265,12 +284,16 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 	defer cancel()
 
 	respID := genID("resp")
+	createdAt := time.Now().Unix()
 	_ = sse.writeJSON(map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
-			"id":     respID,
-			"object": "response",
-			"model":  req.Model,
+			"id":         respID,
+			"object":     "response",
+			"created_at": createdAt,
+			"model":      req.Model,
+			"status":     "in_progress",
+			"output":     []any{},
 		},
 	})
 
@@ -281,24 +304,166 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 		}
 	}
 
-	_, err = adapter.RespondStream(ctx, proxy.ResponsesRequest{
-		Model:  req.Model,
-		Input:  input,
-		Stream: true,
-	}, func(delta string) error {
-		if strings.TrimSpace(delta) == "" {
+	seq := int64(1)
+	nextSeq := func() int64 {
+		s := seq
+		seq++
+		return s
+	}
+
+	reasoningItemID := genID("rsn")
+	messageItemID := genID("msg")
+	reasoningIndex := int64(0)
+	messageIndex := int64(0)
+	reasoningStarted := false
+	messageStarted := false
+	var reasoningText strings.Builder
+	var outputText strings.Builder
+	var reasoningSummaryAdded bool
+
+	startReasoning := func() error {
+		if reasoningStarted {
 			return nil
 		}
-		if writeErr := sse.writeJSON(map[string]any{
-			"type":        "response.output_text.delta",
-			"response_id": respID,
-			"delta":       delta,
-		}); writeErr != nil {
-			cancel()
-			return writeErr
+		reasoningStarted = true
+		if messageStarted {
+			messageIndex = 1
+		}
+		if err := sse.writeJSON(map[string]any{
+			"type":            "response.output_item.added",
+			"sequence_number": nextSeq(),
+			"output_index":    reasoningIndex,
+			"item": map[string]any{
+				"id":      reasoningItemID,
+				"type":    "reasoning",
+				"status":  "in_progress",
+				"summary": []any{},
+			},
+		}); err != nil {
+			return err
+		}
+		if !reasoningSummaryAdded {
+			reasoningSummaryAdded = true
+			return sse.writeJSON(map[string]any{
+				"type":            "response.reasoning_summary_part.added",
+				"sequence_number": nextSeq(),
+				"item_id":         reasoningItemID,
+				"output_index":    reasoningIndex,
+				"summary_index":   0,
+				"part": map[string]any{
+					"type": "summary_text",
+					"text": "",
+				},
+			})
 		}
 		return nil
-	})
+	}
+
+	startMessage := func() error {
+		if messageStarted {
+			return nil
+		}
+		messageStarted = true
+		if reasoningStarted {
+			messageIndex = 1
+		} else {
+			messageIndex = 0
+		}
+		return sse.writeJSON(map[string]any{
+			"type":            "response.output_item.added",
+			"sequence_number": nextSeq(),
+			"output_index":    messageIndex,
+			"item": map[string]any{
+				"id":     messageItemID,
+				"type":   "message",
+				"role":   "assistant",
+				"status": "in_progress",
+				"content": []map[string]any{
+					{"type": "output_text", "text": ""},
+				},
+			},
+		})
+	}
+
+	emitReasoningDelta := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if err := startReasoning(); err != nil {
+			return err
+		}
+		reasoningText.WriteString(delta)
+		if err := sse.writeJSON(map[string]any{
+			"type":            "response.reasoning_summary_text.delta",
+			"sequence_number": nextSeq(),
+			"item_id":         reasoningItemID,
+			"output_index":    reasoningIndex,
+			"summary_index":   0,
+			"delta":           delta,
+		}); err != nil {
+			return err
+		}
+		return sse.writeJSON(map[string]any{
+			"type":            "response.reasoning_text.delta",
+			"sequence_number": nextSeq(),
+			"item_id":         reasoningItemID,
+			"output_index":    reasoningIndex,
+			"content_index":   0,
+			"delta":           delta,
+		})
+	}
+
+	emitOutputDelta := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if err := startMessage(); err != nil {
+			return err
+		}
+		outputText.WriteString(delta)
+		return sse.writeJSON(map[string]any{
+			"type":            "response.output_text.delta",
+			"sequence_number": nextSeq(),
+			"item_id":         messageItemID,
+			"output_index":    messageIndex,
+			"content_index":   0,
+			"delta":           delta,
+			"logprobs":        []any{},
+		})
+	}
+
+	if eventAdapter, ok := adapter.(proxy.ResponsesEventAdapter); ok {
+		_, err = eventAdapter.RespondStreamEvents(ctx, proxy.ResponsesRequest{
+			Model:  req.Model,
+			Input:  input,
+			Stream: true,
+		}, func(ev proxy.ResponseEvent) error {
+			if ev.Kind == proxy.ResponseEventReasoning {
+				if writeErr := emitReasoningDelta(ev.Delta); writeErr != nil {
+					cancel()
+					return writeErr
+				}
+				return nil
+			}
+			if writeErr := emitOutputDelta(ev.Delta); writeErr != nil {
+				cancel()
+				return writeErr
+			}
+			return nil
+		})
+	} else {
+		_, err = adapter.RespondStream(ctx, proxy.ResponsesRequest{
+			Model:  req.Model,
+			Input:  input,
+			Stream: true,
+		}, func(delta string) error {
+			if writeErr := emitOutputDelta(delta); writeErr != nil {
+				cancel()
+				return writeErr
+			}
+			return nil
+		})
+	}
 	if err != nil {
 		_ = sse.writeJSON(map[string]any{
 			"type": "error",
@@ -311,16 +476,107 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 		return
 	}
 
+	if !messageStarted {
+		_ = startMessage()
+	}
+	if reasoningStarted {
+		reasoningFull := reasoningText.String()
+		_ = sse.writeJSON(map[string]any{
+			"type":            "response.reasoning_summary_text.done",
+			"sequence_number": nextSeq(),
+			"item_id":         reasoningItemID,
+			"output_index":    reasoningIndex,
+			"summary_index":   0,
+			"text":            reasoningFull,
+		})
+		_ = sse.writeJSON(map[string]any{
+			"type":            "response.reasoning_summary_part.done",
+			"sequence_number": nextSeq(),
+			"item_id":         reasoningItemID,
+			"output_index":    reasoningIndex,
+			"summary_index":   0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": reasoningFull,
+			},
+		})
+		_ = sse.writeJSON(map[string]any{
+			"type":            "response.reasoning_text.done",
+			"sequence_number": nextSeq(),
+			"item_id":         reasoningItemID,
+			"output_index":    reasoningIndex,
+			"content_index":   0,
+			"text":            reasoningFull,
+		})
+		_ = sse.writeJSON(map[string]any{
+			"type":            "response.output_item.done",
+			"sequence_number": nextSeq(),
+			"output_index":    reasoningIndex,
+			"item": map[string]any{
+				"id":     reasoningItemID,
+				"type":   "reasoning",
+				"status": "completed",
+				"summary": []map[string]any{
+					{"type": "summary_text", "text": reasoningFull},
+				},
+			},
+		})
+	}
+
+	outputFull := outputText.String()
 	_ = sse.writeJSON(map[string]any{
-		"type":        "response.output_text.done",
-		"response_id": respID,
+		"type":            "response.output_text.done",
+		"sequence_number": nextSeq(),
+		"item_id":         messageItemID,
+		"output_index":    messageIndex,
+		"content_index":   0,
+		"text":            outputFull,
+		"logprobs":        []any{},
+	})
+	_ = sse.writeJSON(map[string]any{
+		"type":            "response.output_item.done",
+		"sequence_number": nextSeq(),
+		"output_index":    messageIndex,
+		"item": map[string]any{
+			"id":     messageItemID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []map[string]any{
+				{"type": "output_text", "text": outputFull},
+			},
+		},
+	})
+
+	outputItems := make([]any, 0, 2)
+	if reasoningStarted {
+		outputItems = append(outputItems, map[string]any{
+			"id":     reasoningItemID,
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]any{
+				{"type": "summary_text", "text": reasoningText.String()},
+			},
+		})
+	}
+	outputItems = append(outputItems, map[string]any{
+		"id":     messageItemID,
+		"type":   "message",
+		"role":   "assistant",
+		"status": "completed",
+		"content": []map[string]any{
+			{"type": "output_text", "text": outputFull},
+		},
 	})
 	_ = sse.writeJSON(map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
-			"id":     respID,
-			"object": "response",
-			"model":  req.Model,
+			"id":         respID,
+			"object":     "response",
+			"created_at": createdAt,
+			"model":      req.Model,
+			"status":     "completed",
+			"output":     outputItems,
 		},
 	})
 	_ = sse.writeDone()
