@@ -106,7 +106,7 @@ func (a *ClaudeAdapter) ChatStream(ctx context.Context, req ChatRequest, onDelta
 	if err != nil {
 		fallback, fbErr := a.runClaudeText(ctx, model, prompt)
 		if fbErr != nil {
-			return ChatResponse{}, err
+			return ChatResponse{}, fbErr
 		}
 		text = strings.TrimSpace(fallback)
 		if !emitted && onDelta != nil && text != "" {
@@ -159,7 +159,7 @@ func (a *ClaudeAdapter) RespondStream(ctx context.Context, req ResponsesRequest,
 	if err != nil {
 		fallback, fbErr := a.runClaudeText(ctx, model, prompt)
 		if fbErr != nil {
-			return ResponsesResponse{}, err
+			return ResponsesResponse{}, fbErr
 		}
 		text = strings.TrimSpace(fallback)
 		if !emitted && onDelta != nil && text != "" {
@@ -195,7 +195,7 @@ func (a *ClaudeAdapter) RespondStreamEvents(ctx context.Context, req ResponsesRe
 	if err != nil {
 		fallback, fbErr := a.runClaudeText(ctx, model, prompt)
 		if fbErr != nil {
-			return ResponsesResponse{}, err
+			return ResponsesResponse{}, fbErr
 		}
 		text = strings.TrimSpace(fallback)
 		if onEvent != nil && !emittedOutput && text != "" {
