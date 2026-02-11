@@ -70,9 +70,13 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	for model, c := range m.modelCounts {
 		avgLatencyMs := 0.0
 		avgTokensPerCall := 0.0
+		avgTokensPerSec := 0.0
 		if c.RequestsTotal > 0 {
 			avgLatencyMs = float64(c.LatencyTotalNs) / float64(c.RequestsTotal) / float64(time.Millisecond)
 			avgTokensPerCall = float64(c.TokensTotal) / float64(c.RequestsTotal)
+		}
+		if c.LatencyTotalNs > 0 {
+			avgTokensPerSec = float64(c.TokensTotal) / (float64(c.LatencyTotalNs) / float64(time.Second))
 		}
 		snapshot.Models = append(snapshot.Models, ModelStats{
 			Model:            model,
@@ -84,6 +88,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 			TokensTotal:      c.TokensTotal,
 			AvgLatencyMs:     avgLatencyMs,
 			AvgTokensPerCall: avgTokensPerCall,
+			AvgTokensPerSec:  avgTokensPerSec,
 		})
 	}
 	m.modelMu.RUnlock()
@@ -128,6 +133,7 @@ type ModelStats struct {
 	TokensTotal      uint64
 	AvgLatencyMs     float64
 	AvgTokensPerCall float64
+	AvgTokensPerSec  float64
 }
 
 type modelCounters struct {

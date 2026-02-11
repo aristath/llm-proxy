@@ -624,7 +624,7 @@ func (a *CodexAdapter) runTurnStructured(ctx context.Context, model string, prom
 	)
 
 	emit := func(kind ResponseEventKind, delta string) {
-		if onEvent == nil || callbackErr != nil || strings.TrimSpace(delta) == "" {
+		if onEvent == nil || callbackErr != nil || delta == "" {
 			return
 		}
 		if err := onEvent(ResponseEvent{Kind: kind, Delta: delta}); err != nil {
@@ -632,8 +632,11 @@ func (a *CodexAdapter) runTurnStructured(ctx context.Context, model string, prom
 		}
 	}
 
+	turnCompleted := false
 	notify := func(msg codexRPCMessage) {
 		switch msg.Method {
+		case "turn/completed":
+			turnCompleted = true
 		case "item/reasoning/summaryTextDelta":
 			var payload struct {
 				Delta string `json:"delta"`
@@ -703,21 +706,8 @@ func (a *CodexAdapter) runTurnStructured(ctx context.Context, model string, prom
 		return codexTurnResult{}, err
 	}
 
-	waitDone := false
-	for !waitDone {
-		select {
-		case <-ctx.Done():
-			return codexTurnResult{}, ctx.Err()
-		case msg, ok := <-client.msgs:
-			if !ok {
-				waitDone = true
-				continue
-			}
-			notify(msg)
-			if msg.Method == "turn/completed" {
-				waitDone = true
-			}
-		}
+	if err := waitForTurnCompleted(ctx, client.msgs, notify, turnCompleted); err != nil {
+		return codexTurnResult{}, err
 	}
 	if callbackErr != nil {
 		return codexTurnResult{}, callbackErr
@@ -737,105 +727,26 @@ func (a *CodexAdapter) runTurnStructured(ctx context.Context, model string, prom
 	return result, nil
 }
 
-func (a *CodexAdapter) runTurn(ctx context.Context, model string, prompt string, onDelta func(string) error) (string, error) {
-	client, err := newCodexRPCClient(ctx, a.bin)
-	if err != nil {
-		return "", err
+func waitForTurnCompleted(ctx context.Context, msgs <-chan codexRPCMessage, notify func(codexRPCMessage), alreadyCompleted bool) error {
+	if alreadyCompleted {
+		return nil
 	}
-	defer client.Close()
-
-	if err := client.initialize(); err != nil {
-		return "", err
-	}
-
-	var threadStart struct {
-		Thread struct {
-			ID string `json:"id"`
-		} `json:"thread"`
-	}
-	if err := client.call("thread/start", map[string]any{
-		"model":     model,
-		"ephemeral": true,
-	}, &threadStart, nil); err != nil {
-		return "", err
-	}
-	if threadStart.Thread.ID == "" {
-		return "", errors.New("codex returned empty thread id")
-	}
-
-	var responseText strings.Builder
-	var lastAgentMessage string
-	var callbackErr error
-	notify := func(msg codexRPCMessage) {
-		if msg.Method != "item/agentMessage/delta" {
-			if msg.Method == "codex/event/task_complete" {
-				var payload struct {
-					Msg struct {
-						LastAgentMessage string `json:"last_agent_message"`
-					} `json:"msg"`
-				}
-				if err := json.Unmarshal(msg.Params, &payload); err == nil {
-					lastAgentMessage = payload.Msg.LastAgentMessage
-				}
-			}
-			return
-		}
-		var payload struct {
-			Delta string `json:"delta"`
-		}
-		if err := json.Unmarshal(msg.Params, &payload); err == nil {
-			if callbackErr == nil && onDelta != nil && payload.Delta != "" {
-				if cbErr := onDelta(payload.Delta); cbErr != nil {
-					callbackErr = cbErr
-				}
-			}
-			responseText.WriteString(payload.Delta)
-		}
-	}
-
-	var turnResp map[string]any
-	err = client.call("turn/start", map[string]any{
-		"threadId": threadStart.Thread.ID,
-		"model":    model,
-		"input": []map[string]any{
-			{
-				"type": "text",
-				"text": prompt,
-			},
-		},
-	}, &turnResp, notify)
-	if err != nil {
-		return "", err
-	}
-
-	waitDone := false
-	for !waitDone {
+	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
-		case msg, ok := <-client.msgs:
+			return ctx.Err()
+		case msg, ok := <-msgs:
 			if !ok {
-				waitDone = true
-				continue
+				return nil
 			}
-			notify(msg)
+			if notify != nil {
+				notify(msg)
+			}
 			if msg.Method == "turn/completed" {
-				waitDone = true
+				return nil
 			}
 		}
 	}
-	if callbackErr != nil {
-		return "", callbackErr
-	}
-
-	text := strings.TrimSpace(responseText.String())
-	if text == "" {
-		text = strings.TrimSpace(lastAgentMessage)
-	}
-	if text == "" {
-		return "", errors.New("codex returned empty assistant output")
-	}
-	return text, nil
 }
 
 type Router struct {

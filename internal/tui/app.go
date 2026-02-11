@@ -302,18 +302,19 @@ func renderModelStatsTable(models []api.ModelStats) string {
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%-*s %8s %10s %18s %16s\n",
-		modelWidth, "Model", "Requests", "Tokens", "Avg Time/Response", "Avg Tokens/Call"))
-	b.WriteString(strings.Repeat("─", modelWidth+8+10+18+16+4))
+	b.WriteString(fmt.Sprintf("%-*s %8s %10s %18s %16s %10s\n",
+		modelWidth, "Model", "Requests", "Tokens", "Avg Time/Response", "Avg Tokens/Call", "Avg Tok/s"))
+	b.WriteString(strings.Repeat("─", modelWidth+8+10+18+16+10+5))
 	b.WriteByte('\n')
 	for _, s := range models {
-		row := fmt.Sprintf("%-*s %8d %10d %17.1fms %16.1f",
+		row := fmt.Sprintf("%-*s %8d %10d %17.1fms %16.1f %10.1f",
 			modelWidth,
 			trim(s.Model),
 			s.RequestsTotal,
 			s.TokensTotal,
 			s.AvgLatencyMs,
 			s.AvgTokensPerCall,
+			s.AvgTokensPerSec,
 		)
 		b.WriteString(row)
 		b.WriteByte('\n')

@@ -227,7 +227,7 @@ func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 	var out strings.Builder
 
 	_, err = adapter.ChatStream(ctx, in, func(delta string) error {
-		if strings.TrimSpace(delta) == "" {
+		if delta == "" {
 			return nil
 		}
 		out.WriteString(delta)
@@ -322,8 +322,14 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 
 	reasoningItemID := genID("rsn")
 	messageItemID := genID("msg")
-	reasoningIndex := int64(0)
-	messageIndex := int64(0)
+	reasoningIndex := int64(-1)
+	messageIndex := int64(-1)
+	nextOutputIndex := int64(0)
+	assignOutputIndex := func() int64 {
+		index := nextOutputIndex
+		nextOutputIndex++
+		return index
+	}
 	reasoningStarted := false
 	messageStarted := false
 	var reasoningText strings.Builder
@@ -335,9 +341,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 			return nil
 		}
 		reasoningStarted = true
-		if messageStarted {
-			messageIndex = 1
-		}
+		reasoningIndex = assignOutputIndex()
 		if err := sse.writeJSON(map[string]any{
 			"type":            "response.output_item.added",
 			"sequence_number": nextSeq(),
@@ -373,11 +377,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req open
 			return nil
 		}
 		messageStarted = true
-		if reasoningStarted {
-			messageIndex = 1
-		} else {
-			messageIndex = 0
-		}
+		messageIndex = assignOutputIndex()
 		return sse.writeJSON(map[string]any{
 			"type":            "response.output_item.added",
 			"sequence_number": nextSeq(),
