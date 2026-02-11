@@ -44,5 +44,7 @@ type ResponsesResponse struct {
 type Adapter interface {
 	ListModels(context.Context) ([]Model, error)
 	Chat(context.Context, ChatRequest) (ChatResponse, error)
+	ChatStream(context.Context, ChatRequest, func(string) error) (ChatResponse, error)
 	Respond(context.Context, ResponsesRequest) (ResponsesResponse, error)
+	RespondStream(context.Context, ResponsesRequest, func(string) error) (ResponsesResponse, error)
 }

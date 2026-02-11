@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -58,7 +59,7 @@ func (s *Server) CreateChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Stream != nil && *req.Stream {
-		writeError(w, http.StatusNotImplemented, "not_implemented", "streaming will be enabled with CLI adapters")
+		s.streamChatCompletion(w, r, req)
 		return
 	}
 
@@ -116,7 +117,7 @@ func (s *Server) CreateResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Stream != nil && *req.Stream {
-		writeError(w, http.StatusNotImplemented, "not_implemented", "streaming will be enabled with CLI adapters")
+		s.streamResponse(w, r, req)
 		return
 	}
 
@@ -162,6 +163,169 @@ func (s *Server) CreateResponse(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) streamChatCompletion(w http.ResponseWriter, r *http.Request, req openapiv1.ChatCompletionsRequest) {
+	adapter, err := s.router.AdapterForModel(req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	sse, err := newSSEWriter(w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	reqID := genID("chatcmpl")
+	_ = sse.writeJSON(map[string]any{
+		"id":     reqID,
+		"object": "chat.completion.chunk",
+		"model":  req.Model,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"delta": map[string]any{"role": "assistant"},
+			},
+		},
+	})
+
+	in := proxy.ChatRequest{
+		Model:    req.Model,
+		Messages: make([]proxy.Message, 0, len(req.Messages)),
+		Stream:   true,
+	}
+	for _, m := range req.Messages {
+		in.Messages = append(in.Messages, proxy.Message{Role: m.Role, Content: m.Content})
+	}
+
+	_, err = adapter.ChatStream(ctx, in, func(delta string) error {
+		if strings.TrimSpace(delta) == "" {
+			return nil
+		}
+		if writeErr := sse.writeJSON(map[string]any{
+			"id":     reqID,
+			"object": "chat.completion.chunk",
+			"model":  req.Model,
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{"content": delta},
+				},
+			},
+		}); writeErr != nil {
+			cancel()
+			return writeErr
+		}
+		return nil
+	})
+	if err != nil {
+		_ = sse.writeJSON(map[string]any{
+			"id":     reqID,
+			"object": "error",
+			"error": map[string]any{
+				"type":    "upstream_error",
+				"message": err.Error(),
+			},
+		})
+		_ = sse.writeDone()
+		return
+	}
+
+	_ = sse.writeJSON(map[string]any{
+		"id":     reqID,
+		"object": "chat.completion.chunk",
+		"model":  req.Model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         map[string]any{},
+				"finish_reason": "stop",
+			},
+		},
+	})
+	_ = sse.writeDone()
+}
+
+func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, req openapiv1.ResponsesRequest) {
+	adapter, err := s.router.AdapterForModel(req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	sse, err := newSSEWriter(w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	respID := genID("resp")
+	_ = sse.writeJSON(map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id":     respID,
+			"object": "response",
+			"model":  req.Model,
+		},
+	})
+
+	var input any
+	if req.Input != nil {
+		if raw, marshalErr := req.Input.MarshalJSON(); marshalErr == nil {
+			_ = json.Unmarshal(raw, &input)
+		}
+	}
+
+	_, err = adapter.RespondStream(ctx, proxy.ResponsesRequest{
+		Model:  req.Model,
+		Input:  input,
+		Stream: true,
+	}, func(delta string) error {
+		if strings.TrimSpace(delta) == "" {
+			return nil
+		}
+		if writeErr := sse.writeJSON(map[string]any{
+			"type":        "response.output_text.delta",
+			"response_id": respID,
+			"delta":       delta,
+		}); writeErr != nil {
+			cancel()
+			return writeErr
+		}
+		return nil
+	})
+	if err != nil {
+		_ = sse.writeJSON(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "upstream_error",
+				"message": err.Error(),
+			},
+		})
+		_ = sse.writeDone()
+		return
+	}
+
+	_ = sse.writeJSON(map[string]any{
+		"type":        "response.output_text.done",
+		"response_id": respID,
+	})
+	_ = sse.writeJSON(map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"id":     respID,
+			"object": "response",
+			"model":  req.Model,
+		},
+	})
+	_ = sse.writeDone()
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -175,6 +339,42 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 			"message": message,
 		},
 	})
+}
+
+type sseWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func newSSEWriter(w http.ResponseWriter) (*sseWriter, error) {
+	f, ok := w.(http.Flusher)
+	if !ok {
+		return nil, fmt.Errorf("streaming not supported by response writer")
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	return &sseWriter{w: w, f: f}, nil
+}
+
+func (s *sseWriter) writeJSON(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(s.w, "data: %s\n\n", b); err != nil {
+		return err
+	}
+	s.f.Flush()
+	return nil
+}
+
+func (s *sseWriter) writeDone() error {
+	if _, err := fmt.Fprint(s.w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	s.f.Flush()
+	return nil
 }
 
 func genID(prefix string) string {

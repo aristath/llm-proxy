@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"llm-proxy/internal/api"
 	"llm-proxy/internal/openapiv1"
 	"llm-proxy/internal/proxy"
+	"llm-proxy/internal/tui"
 )
 
 func main() {
@@ -16,13 +20,39 @@ func main() {
 		addr = ":8080"
 	}
 
-	router := proxy.NewRouter(&proxy.ClaudeAdapter{}, &proxy.CodexAdapter{})
-	server := api.NewServer(router)
+	router := proxy.NewRouter(proxy.NewClaudeAdapter(), proxy.NewCodexAdapter())
+	apiServer := api.NewServer(router)
+	metrics := api.NewMetrics()
 
-	handler := openapiv1.HandlerFromMux(server, http.NewServeMux())
+	handler := openapiv1.HandlerFromMux(apiServer, http.NewServeMux())
+	handler = metrics.Middleware(handler)
+
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		err := httpServer.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+		close(errCh)
+	}()
 
 	log.Printf("llm-proxy listening on %s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatal(err)
+
+	app := tui.New(addr, metrics, httpServer, errCh)
+	runErr := app.Run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	shutdownErr := app.Shutdown(ctx)
+	if shutdownErr != nil {
+		log.Printf("shutdown error: %v", shutdownErr)
+	}
+
+	if runErr != nil {
+		log.Fatal(runErr)
 	}
 }
